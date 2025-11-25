@@ -1,4 +1,4 @@
-﻿// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
+// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
 // See the LICENCE file in the repository root for full licence text.
 
 #nullable disable
@@ -380,11 +380,11 @@ namespace osu.Framework.Audio
         protected virtual bool InitBass(int device)
         {
             // this likely doesn't help us but also doesn't seem to cause any issues or any cpu increase.
-            Bass.UpdatePeriod = 5;
+            Bass.UpdatePeriod = 1;
 
             // reduce latency to a known sane minimum.
-            Bass.DeviceBufferLength = 10;
-            Bass.PlaybackBufferLength = 100;
+            Bass.DeviceBufferLength = 2;
+            Bass.PlaybackBufferLength = 2;
 
             // ensure there are no brief delays on audio operations (causing stream stalls etc.) after periods of silence.
             Bass.DeviceNonStop = true;
