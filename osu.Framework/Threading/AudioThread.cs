@@ -1,4 +1,4 @@
-﻿// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
+// Copyright (c) ppy Pty Ltd <contact@ppy.sh>. Licensed under the MIT Licence.
 // See the LICENCE file in the repository root for full licence text.
 
 using osu.Framework.Statistics;
@@ -7,8 +7,10 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using ManagedBass;
+using ManagedBass; // Changed from Wasapi
+using ManagedBass.Fx;  // Added for splitters
 using ManagedBass.Mix;
-using ManagedBass.Wasapi;
+using ManagedBass.Asio;
 using osu.Framework.Audio;
 using osu.Framework.Bindables;
 using osu.Framework.Development;
@@ -121,8 +123,9 @@ namespace osu.Framework.Threading
 
         // TODO: All this bass init stuff should probably not be in this class.
 
-        private WasapiProcedure? wasapiProcedure;
-        private WasapiNotifyProcedure? wasapiNotifyProcedure;
+        // BASSASIO uses non-interleaved channels, so we need splitters to map the mixer
+        private readonly List<int> asioSplitters = new List<int>();
+        private AsioNotifyProcedure? asioNotifyProcedure;
 
         /// <summary>
         /// If a global mixer is being used, this will be the BASS handle for it.
@@ -130,7 +133,7 @@ namespace osu.Framework.Threading
         /// </summary>
         private readonly Bindable<int?> globalMixerHandle = new Bindable<int?>();
 
-        internal bool InitDevice(int deviceId, bool useExperimentalWasapi)
+        internal bool InitDevice(int deviceId, bool useAsio) // Renamed parameter
         {
             Debug.Assert(ThreadSafety.IsAudioThread);
             Trace.Assert(deviceId != -1); // The real device ID should always be used, as the -1 device has special cases which are hard to work with.
@@ -139,10 +142,10 @@ namespace osu.Framework.Threading
             if (!Bass.Init(deviceId, Flags: (DeviceInitFlags)128)) // 128 == BASS_DEVICE_REINIT
                 return false;
 
-            if (useExperimentalWasapi)
-                attemptWasapiInitialisation();
+            if (useAsio)
+                attemptAsioInitialisation();
             else
-                freeWasapi();
+                freeAsio();
 
             initialised_devices.Add(deviceId);
             return true;
@@ -160,7 +163,7 @@ namespace osu.Framework.Threading
                 Bass.Free();
             }
 
-            freeWasapi();
+            freeAsio(); // Renamed method
 
             if (selectedDevice != deviceId && canSelectDevice(selectedDevice))
                 Bass.CurrentDevice = selectedDevice;
@@ -182,88 +185,112 @@ namespace osu.Framework.Threading
             }
         }
 
-        private bool attemptWasapiInitialisation()
+       private bool attemptAsioInitialisation()
         {
             if (RuntimeInfo.OS != RuntimeInfo.Platform.Windows)
                 return false;
 
-            Logger.Log("Attempting local BassWasapi initialisation");
+            Logger.Log("Attempting local BassAsio initialisation");
 
-            int wasapiDevice = -1;
-
-            // WASAPI device indices don't match normal BASS devices.
-            // Each device is listed multiple times with each supported channel/frequency pair.
-            //
-            // Working backwards to find the correct device is how bass does things internally (see BassWasapi.GetBassDevice).
+            int asioDevice = -1;
             if (Bass.CurrentDevice > 0)
             {
                 string driver = Bass.GetDeviceInfo(Bass.CurrentDevice).Driver;
 
                 if (!string.IsNullOrEmpty(driver))
                 {
-                    // In the normal execution case, BassWasapi.GetDeviceInfo will return false as soon as we reach the end of devices.
-                    // This while condition is just a safety to avoid looping forever.
-                    // It's intentionally quite high because if a user has many audio devices, this list can get long.
-                    //
-                    // Retrieving device info here isn't free. In the future we may want to investigate a better method.
-                    while (wasapiDevice < 16384)
+                    int currentAsioIndex = 0;
+                    while (BassAsio.GetDeviceInfo(currentAsioIndex, out AsioDeviceInfo info))
                     {
-                        if (!BassWasapi.GetDeviceInfo(++wasapiDevice, out WasapiDeviceInfo info))
+                        if (info.Name == driver)
+                        {
+                            asioDevice = currentAsioIndex;
+                            Logger.Log($"Matched BASS device driver '{driver}' to ASIO device {asioDevice} ('{info.Name}')");
                             break;
-
-                        if (info.ID == driver)
-                            break;
+                        }
+                        currentAsioIndex++;
                     }
+
+                    if (asioDevice == -1)
+                        Logger.Log($"BASS device driver '{driver}' has no matching ASIO device. Falling back to default ASIO device.");
+                }
+                else
+                {
+                    Logger.Log("Current BASS device has no driver name, cannot match to ASIO device. Falling back to default ASIO device.");
                 }
             }
+            else
+            {
+                Logger.Log("Current BASS device is No-Sound, falling back to default ASIO device.");
+            }
 
-            // To keep things in a sane state let's only keep one device initialised via wasapi.
-            freeWasapi();
-            return initWasapi(wasapiDevice);
+
+            freeAsio();
+            return initAsio(0);
         }
 
-        private bool initWasapi(int wasapiDevice)
+      private bool initAsio(int asioDevice)
         {
-            // This is intentionally initialised inline and stored to a field.
-            // If we don't do this, it gets GC'd away.
-            wasapiProcedure = (buffer, length, _) =>
+            // This is intentionally initialised inline and stored to a field...
+            asioNotifyProcedure = (notify, _) => Scheduler.Add(() =>
             {
-                if (globalMixerHandle.Value == null)
-                    return 0;
-
-                return Bass.ChannelGetData(globalMixerHandle.Value!.Value, buffer, length);
-            };
-            wasapiNotifyProcedure = (notify, device, _) => Scheduler.Add(() =>
-            {
-                if (notify == WasapiNotificationType.DefaultOutput)
+                Logger.Log($"BASSASIO notification received: {notify}");
+                if (notify == AsioNotify.Reset)
                 {
-                    freeWasapi();
-                    initWasapi(device);
+                    Logger.Log("ASIO device reset, freeing resources. Device must be re-initialised externally.");
+                    freeAsio();
                 }
             });
 
-            bool initialised = BassWasapi.Init(wasapiDevice, Procedure: wasapiProcedure, Flags: WasapiInitFlags.EventDriven | WasapiInitFlags.AutoFormat, Buffer: 0f, Period: float.Epsilon);
-            Logger.Log($"Initialising BassWasapi for device {wasapiDevice}...{(initialised ? "success!" : "FAILED")}");
+            bool initialised = BassAsio.Init(asioDevice, AsioInitFlags.Thread);
+            Logger.Log($"Initialising BassAsio for device {asioDevice}...{(initialised ? "success!" : "FAILED")}");
 
             if (!initialised)
                 return false;
 
-            BassWasapi.GetInfo(out var wasapiInfo);
-            globalMixerHandle.Value = BassMix.CreateMixerStream(wasapiInfo.Frequency, wasapiInfo.Channels, BassFlags.MixerNonStop | BassFlags.Decode | BassFlags.Float);
-            BassWasapi.Start();
+            BassAsio.GetInfo(out var asioInfo);
+            Logger.Log($"ASIO Info: Device={asioDevice}, Rate={BassAsio.Rate}, Outputs={asioInfo.Outputs}");
 
-            BassWasapi.SetNotify(wasapiNotifyProcedure);
+
+            globalMixerHandle.Value = BassMix.CreateMixerStream((int)BassAsio.Rate, asioInfo.Outputs, BassFlags.MixerNonStop | BassFlags.Decode | BassFlags.Float);
+
+            if (globalMixerHandle.Value == null)
+            {
+                Logger.Log($"Failed to create global mixer stream: {Bass.LastError}");
+                BassAsio.Free();
+                return false;
+            }
+
+            var mixerInfo = Bass.ChannelGetInfo(globalMixerHandle.Value.Value);
+            Logger.Log($"Mixer stream created. Handle: {globalMixerHandle.Value.Value}, Channels: {mixerInfo.Channels}, Freq: {mixerInfo.Frequency}");
+            Logger.Log("Setting mixer as source for ASIO channel 0");
+            if (!BassAsio.ChannelEnableBass(false, 0, globalMixerHandle.Value.Value, true))
+            {
+                Logger.Log($"Failed to set ASIO channel 0 with join: {Bass.LastError}");
+
+                Bass.StreamFree(globalMixerHandle.Value.Value);
+                globalMixerHandle.Value = null;
+                BassAsio.Free();
+                return false;
+            }
+
+            BassAsio.Start();
+            Logger.Log($"BassASIO started?: {BassAsio.IsStarted.ToString()}");
+            BassAsio.SetNotify(asioNotifyProcedure);
             return true;
         }
 
-        private void freeWasapi()
+        private void freeAsio()
         {
             if (globalMixerHandle.Value == null) return;
 
-            // The mixer probably doesn't need to be recycled. Just keeping things sane for now.
+            BassAsio.Stop();
+            BassAsio.SetNotify(null);
+            foreach (int splitter in asioSplitters)
+                Bass.StreamFree(splitter);
+            asioSplitters.Clear();
             Bass.StreamFree(globalMixerHandle.Value.Value);
-            BassWasapi.Stop();
-            BassWasapi.Free();
+            BassAsio.Free();
             globalMixerHandle.Value = null;
         }
 
