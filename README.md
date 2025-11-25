@@ -1,3 +1,20 @@
+# osu framework with ASIO
+
+need to use your own bassasio.dll file and build osu with local framework after cloning repos
+has issues lol but fun to try out
+
+
+
+
+
+
+
+
+
+
+
+
+
 <p align="center">
   <img width="500px" src="assets/o!f Logo Large FC.svg">
 </p>
